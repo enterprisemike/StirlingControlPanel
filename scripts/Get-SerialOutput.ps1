@@ -1,0 +1,1 @@
+& "$HOME/.platformio/penv/bin/platformio" device monitor --port /dev/cu.usbmodem101 --baud 115200
