@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <AccelStepper.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
@@ -7,8 +8,45 @@
 namespace {
 
 WebServer server(80);
+AccelStepper gaugeStepper(
+  AccelStepper::FULL4WIRE,
+  kStepperIn1Pin,
+  kStepperIn3Pin,
+  kStepperIn2Pin,
+  kStepperIn4Pin);
+
+enum class StepperTestState {
+  ForwardSweep,
+  PauseAtMax,
+  ReverseSweep,
+  PauseAtMin
+};
+
+StepperTestState stepperState = StepperTestState::ForwardSweep;
+unsigned long stepperStateStartMs = 0;
+const long kSweepSteps = (kStepperStepsPerRevolution * kGaugeSweepDegrees) / 360;
+const float kForwardSpeedStepsPerSec =
+  static_cast<float>(kSweepSteps) / (static_cast<float>(kForwardSweepMs) / 1000.0f);
+const float kReverseSpeedStepsPerSec =
+  static_cast<float>(kSweepSteps) / (static_cast<float>(kReverseSweepMs) / 1000.0f);
+const char kStepperPresenceStatus[] = "not_verifiable_without_feedback";
+
 unsigned long lastHeartbeatMs = 0;
 bool ledState = false;
+
+const __FlashStringHelper *stepperStateLabel(StepperTestState state) {
+  switch (state) {
+    case StepperTestState::ForwardSweep:
+      return F("forward_sweep");
+    case StepperTestState::PauseAtMax:
+      return F("pause_at_max");
+    case StepperTestState::ReverseSweep:
+      return F("reverse_sweep");
+    case StepperTestState::PauseAtMin:
+      return F("pause_at_min");
+  }
+  return F("unknown");
+}
 
 void setStatusLed(bool enabled) {
   digitalWrite(kStatusLedPin, enabled ? HIGH : LOW);
@@ -33,6 +71,8 @@ String buildStatusJson() {
   json += "\"uptime\":\"" + formatUptime(millis()) + "\",";
   json += "\"heartbeat_ms\":" + String(kHeartbeatIntervalMs) + ",";
   json += "\"led_state\":\"" + String(ledState ? "on" : "off") + "\",";
+  json += "\"stepper_state\":\"" + String(stepperStateLabel(stepperState)) + "\",";
+  json += "\"stepper_driver_presence\":\"" + String(kStepperPresenceStatus) + "\",";
   json += "\"ap_ssid\":\"" + String(kApSsid) + "\",";
   json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
   json += "\"station_count\":" + String(WiFi.softAPgetStationNum());
@@ -65,6 +105,8 @@ String buildDashboardPage() {
   appendItem(F("Uptime"), formatUptime(millis()));
   appendItem(F("Heartbeat"), String(kHeartbeatIntervalMs) + F(" ms"));
   appendItem(F("LED State"), String(ledState ? "ON" : "OFF"));
+  appendItem(F("Stepper State"), String(stepperStateLabel(stepperState)));
+  appendItem(F("Stepper Driver Presence"), String(kStepperPresenceStatus));
   appendItem(F("AP SSID"), String(kApSsid));
   appendItem(F("AP IP"), WiFi.softAPIP().toString());
   appendItem(F("Connected Clients"), String(WiFi.softAPgetStationNum()));
@@ -90,6 +132,60 @@ void logStartupBanner() {
   Serial.println(kSerialBaudRate);
   Serial.print("Status LED pin: ");
   Serial.println(kStatusLedPin);
+  Serial.print("Stepper sweep steps (270 deg): ");
+  Serial.println(kSweepSteps);
+  Serial.print("Stepper driver presence detection: ");
+  Serial.println(kStepperPresenceStatus);
+}
+
+void startStepperTest() {
+  gaugeStepper.setMaxSpeed(kReverseSpeedStepsPerSec + 200.0f);
+  gaugeStepper.setSpeed(kForwardSpeedStepsPerSec);
+  gaugeStepper.setCurrentPosition(0);
+  stepperState = StepperTestState::ForwardSweep;
+  stepperStateStartMs = millis();
+  Serial.println("Stepper test started: 1.0s forward, 1.0s pause, 0.5s return, 1.0s pause.");
+}
+
+void updateStepperTest() {
+  const unsigned long now = millis();
+  const unsigned long elapsedMs = now - stepperStateStartMs;
+
+  switch (stepperState) {
+    case StepperTestState::ForwardSweep:
+      gaugeStepper.setSpeed(kForwardSpeedStepsPerSec);
+      gaugeStepper.runSpeed();
+      if (elapsedMs >= kForwardSweepMs) {
+        gaugeStepper.setCurrentPosition(kSweepSteps);
+        stepperState = StepperTestState::PauseAtMax;
+        stepperStateStartMs = now;
+      }
+      break;
+
+    case StepperTestState::PauseAtMax:
+      if (elapsedMs >= kPauseAtLimitMs) {
+        stepperState = StepperTestState::ReverseSweep;
+        stepperStateStartMs = now;
+      }
+      break;
+
+    case StepperTestState::ReverseSweep:
+      gaugeStepper.setSpeed(-kReverseSpeedStepsPerSec);
+      gaugeStepper.runSpeed();
+      if (elapsedMs >= kReverseSweepMs) {
+        gaugeStepper.setCurrentPosition(0);
+        stepperState = StepperTestState::PauseAtMin;
+        stepperStateStartMs = now;
+      }
+      break;
+
+    case StepperTestState::PauseAtMin:
+      if (elapsedMs >= kPauseAtLimitMs) {
+        stepperState = StepperTestState::ForwardSweep;
+        stepperStateStartMs = now;
+      }
+      break;
+  }
 }
 
 void startAccessPoint() {
@@ -116,10 +212,12 @@ void setup() {
   delay(200);
   logStartupBanner();
   startAccessPoint();
+  startStepperTest();
 }
 
 void loop() {
   server.handleClient();
+  updateStepperTest();
 
   const unsigned long now = millis();
 
