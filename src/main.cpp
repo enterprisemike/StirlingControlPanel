@@ -1,5 +1,9 @@
 #include <Arduino.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <Adafruit_SSD1306.h>
 #include <AccelStepper.h>
+#include <Wire.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
@@ -8,6 +12,11 @@
 namespace {
 
 WebServer server(80);
+#if STIRLING_OLED_DRIVER == STIRLING_OLED_DRIVER_SH1106
+Adafruit_SH1106G oled(kOledWidth, kOledHeight, &Wire, -1);
+#else
+Adafruit_SSD1306 oled(kOledWidth, kOledHeight, &Wire, -1);
+#endif
 AccelStepper gaugeStepper(
   AccelStepper::FULL4WIRE,
   kStepperIn1Pin,
@@ -33,6 +42,7 @@ const char kStepperPresenceStatus[] = "not_verifiable_without_feedback";
 
 unsigned long lastHeartbeatMs = 0;
 bool ledState = false;
+bool oledReady = false;
 
 const __FlashStringHelper *stepperStateLabel(StepperTestState state) {
   switch (state) {
@@ -48,8 +58,112 @@ const __FlashStringHelper *stepperStateLabel(StepperTestState state) {
   return F("unknown");
 }
 
+void scanI2cBus() {
+  Serial.println("I2C scan start");
+
+  uint8_t deviceCount = 0;
+  for (uint8_t address = 1; address < 127; ++address) {
+    Wire.beginTransmission(address);
+    const uint8_t error = Wire.endTransmission();
+
+    if (error == 0) {
+      Serial.print("I2C device found at 0x");
+      if (address < 16) {
+        Serial.print('0');
+      }
+      Serial.println(address, HEX);
+      ++deviceCount;
+    }
+  }
+
+  if (deviceCount == 0) {
+    Serial.println("I2C scan found no devices");
+  } else {
+    Serial.print("I2C scan found devices: ");
+    Serial.println(deviceCount);
+  }
+}
+
+void runOledTestPattern() {
+  if (!oledReady) {
+    return;
+  }
+
+  oled.clearDisplay();
+  oled.fillRect(0, 0, kOledWidth, kOledHeight, SH110X_WHITE);
+  oled.display();
+  delay(kOledTestPatternHoldMs);
+
+  oled.clearDisplay();
+  oled.drawRect(0, 0, kOledWidth, kOledHeight, SH110X_WHITE);
+  oled.drawLine(0, 0, kOledWidth - 1, kOledHeight - 1, SH110X_WHITE);
+  oled.drawLine(kOledWidth - 1, 0, 0, kOledHeight - 1, SH110X_WHITE);
+  oled.display();
+  delay(kOledTestPatternHoldMs);
+
+  oled.clearDisplay();
+  oled.display();
+}
+
+void renderOledStatus() {
+  if (!oledReady) {
+    return;
+  }
+
+  oled.clearDisplay();
+  oled.setTextColor(SH110X_WHITE);
+
+#if STIRLING_OLED_HEIGHT <= 32
+  oled.setTextSize(2);
+  oled.setCursor(0, 0);
+  oled.print(F("LED "));
+  oled.println(ledState ? F("ON") : F("OFF"));
+
+  oled.setTextSize(1);
+  oled.setCursor(0, 24);
+  oled.print(F("IP "));
+  oled.println(WiFi.softAPIP());
+#else
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);
+  oled.println(F("Stirling Panel"));
+  oled.println();
+
+  oled.setTextSize(2);
+  oled.print(F("LED "));
+  oled.println(ledState ? F("ON") : F("OFF"));
+
+  oled.setTextSize(1);
+  oled.println();
+  oled.print(F("IP "));
+  oled.println(WiFi.softAPIP());
+#endif
+
+  oled.display();
+}
+
 void setStatusLed(bool enabled) {
+  ledState = enabled;
   digitalWrite(kStatusLedPin, enabled ? HIGH : LOW);
+  renderOledStatus();
+}
+
+void initOled() {
+  Wire.begin(kOledSdaPin, kOledSclPin);
+  scanI2cBus();
+
+#if STIRLING_OLED_DRIVER == STIRLING_OLED_DRIVER_SH1106
+  if (!oled.begin(kOledI2cAddress, true)) {
+#else
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, kOledI2cAddress)) {
+#endif
+    Serial.println("OLED init failed");
+    return;
+  }
+
+  oledReady = true;
+  runOledTestPattern();
+  renderOledStatus();
 }
 
 String formatUptime(unsigned long uptimeMs) {
@@ -132,6 +246,21 @@ void logStartupBanner() {
   Serial.println(kSerialBaudRate);
   Serial.print("Status LED pin: ");
   Serial.println(kStatusLedPin);
+  Serial.print("OLED SDA pin: ");
+  Serial.println(kOledSdaPin);
+  Serial.print("OLED SCL pin: ");
+  Serial.println(kOledSclPin);
+  Serial.print("OLED driver: ");
+#if STIRLING_OLED_DRIVER == STIRLING_OLED_DRIVER_SH1106
+  Serial.println("SH1106");
+#else
+  Serial.println("SSD1306");
+#endif
+  Serial.print("OLED I2C address: 0x");
+  if (kOledI2cAddress < 16) {
+    Serial.print('0');
+  }
+  Serial.println(kOledI2cAddress, HEX);
   Serial.print("Stepper sweep steps (270 deg): ");
   Serial.println(kSweepSteps);
   Serial.print("Stepper driver presence detection: ");
@@ -200,16 +329,19 @@ void startAccessPoint() {
   Serial.println(kApSsid);
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
+
+  renderOledStatus();
 }
 
 }  // namespace
 
 void setup() {
   pinMode(kStatusLedPin, OUTPUT);
-  setStatusLed(false);
 
   Serial.begin(kSerialBaudRate);
   delay(200);
+  initOled();
+  setStatusLed(false);
   logStartupBanner();
   startAccessPoint();
   startStepperTest();
@@ -223,8 +355,7 @@ void loop() {
 
   if (now - lastHeartbeatMs >= kHeartbeatIntervalMs) {
     lastHeartbeatMs = now;
-    ledState = !ledState;
-    setStatusLed(ledState);
+    setStatusLed(!ledState);
 
     Serial.print("Heartbeat ms=");
     Serial.print(now);
