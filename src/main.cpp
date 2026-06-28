@@ -311,6 +311,32 @@ void logStartupBanner() {
 }
 
 bool runSdCardSelfTest() {
+  if (!SD.exists(kSdCardSoundsDir) && !SD.mkdir(kSdCardSoundsDir)) {
+    sdCardStatus = "mkdir_sounds_failed";
+    return false;
+  }
+
+  if (!SD.exists(kSdCardLogsDir) && !SD.mkdir(kSdCardLogsDir)) {
+    sdCardStatus = "mkdir_logs_failed";
+    return false;
+  }
+
+  if (!SD.exists(kSdCardConfigDir) && !SD.mkdir(kSdCardConfigDir)) {
+    sdCardStatus = "mkdir_config_failed";
+    return false;
+  }
+
+  if (!SD.exists(kSdCardSoundsReadmeFile)) {
+    File soundsReadmeFile = SD.open(kSdCardSoundsReadmeFile, FILE_WRITE);
+    if (!soundsReadmeFile) {
+      sdCardStatus = "sounds_readme_failed";
+      return false;
+    }
+    soundsReadmeFile.println("Place sound files for the Stirling Control Panel in this folder.");
+    soundsReadmeFile.println("Example future uses: whistle, bell, chuff, and alerts.");
+    soundsReadmeFile.close();
+  }
+
   File testFile = SD.open(kSdCardTestFile, FILE_WRITE);
   if (!testFile) {
     sdCardStatus = "test_open_failed";
@@ -342,6 +368,17 @@ bool runSdCardSelfTest() {
     distanceFile.println("0.000");
     distanceFile.close();
   }
+
+  File bootLogFile = SD.open(kSdCardBootLogFile, FILE_APPEND);
+  if (!bootLogFile) {
+    sdCardStatus = "boot_log_failed";
+    return false;
+  }
+  bootLogFile.print("boot_ms=");
+  bootLogFile.print(millis());
+  bootLogFile.print(", firmware=");
+  bootLogFile.println(kFirmwareVersion);
+  bootLogFile.close();
 
   sdCardStatus = "mounted_tested";
   return true;
