@@ -58,3 +58,12 @@ constexpr float kBatteryDividerTopOhms = 14700.0f;
 constexpr float kBatteryDividerBottomOhms = 1000.0f;
 constexpr float kBatteryAdcReferenceVolts = 3.3f;
 constexpr float kBatteryCalibrationFactor = 1.1284f;
+
+// MicroSD adapter (SPI) for audio, logs, and cumulative distance storage.
+constexpr uint8_t kSdCardCsPin = 10;
+constexpr uint8_t kSdCardSckPin = 11;
+constexpr uint8_t kSdCardMosiPin = 12;
+constexpr uint8_t kSdCardMisoPin = 13;
+constexpr uint32_t kSdCardSpiFrequencyHz = 1000000;
+constexpr char kSdCardTestFile[] = "/sd_test.txt";
+constexpr char kSdCardDistanceFile[] = "/distance_km.txt";

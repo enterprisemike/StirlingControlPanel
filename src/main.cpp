@@ -2,6 +2,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 #include <Adafruit_SSD1306.h>
+#include <SD.h>
+#include <SPI.h>
 #include <Wire.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -11,6 +13,7 @@
 namespace {
 
 WebServer server(80);
+SPIClass sdSpi(FSPI);
 #if STIRLING_OLED_DRIVER == STIRLING_OLED_DRIVER_SH1106
 Adafruit_SH1106G oled(kOledWidth, kOledHeight, &Wire, -1);
 #else
@@ -28,6 +31,8 @@ float hallShaftRpm = 0.0f;
 float hallSpeedKmh = 0.0f;
 unsigned long lastBatterySampleMs = 0;
 float batteryVoltage = 0.0f;
+bool sdCardReady = false;
+String sdCardStatus = "not_initialized";
 
 unsigned long lastHeartbeatMs = 0;
 bool ledState = false;
@@ -117,24 +122,19 @@ void renderOledStatus() {
   oled.setTextSize(1);
   oled.setCursor(0, 0);
   oled.println(F("Stirling Panel"));
-  oled.println();
-
-  oled.setTextSize(2);
-  oled.print(F("LED "));
-  oled.println(ledState ? F("ON") : F("OFF"));
-
-  oled.setTextSize(1);
-  oled.println();
   oled.print(F("IP "));
   oled.println(WiFi.softAPIP());
-  oled.print(F("SPD "));
-  oled.print(hallSpeedKmh, 1);
-  oled.println(F(" km/h"));
   oled.print(F("BAT "));
   oled.print(batteryVoltage, 1);
-  oled.println(F(" V"));
+  oled.print(F("V SD "));
+  oled.println(sdCardReady ? F("OK") : F("ERR"));
+  oled.print(F("SPD "));
+  oled.print(hallSpeedKmh, 1);
+  oled.println(F(" kmh"));
   oled.print(F("PLS "));
   oled.println(pulseTotal);
+  oled.print(F("LED "));
+  oled.println(ledState ? F("ON") : F("OFF"));
 #endif
 
   oled.display();
@@ -196,6 +196,8 @@ String buildStatusJson() {
   json += "\"heartbeat_ms\":" + String(kHeartbeatIntervalMs) + ",";
   json += "\"led_state\":\"" + String(ledState ? "on" : "off") + "\",";
   json += "\"motor_control_mode\":\"" + String(kMotorControlMode) + "\",";
+  json += "\"sd_ready\":" + String(sdCardReady ? "true" : "false") + ",";
+  json += "\"sd_status\":\"" + sdCardStatus + "\",";
   json += "\"battery_voltage\":" + String(batteryVoltage, 2) + ",";
   json += "\"hall_total_pulses\":" + String(pulseTotal) + ",";
   json += "\"hall_last_pulse_ms_ago\":" + String(lastPulseMsAgo) + ",";
@@ -235,6 +237,7 @@ String buildDashboardPage() {
   appendItem(F("Heartbeat"), String(kHeartbeatIntervalMs) + F(" ms"));
   appendItem(F("LED State"), String(ledState ? "ON" : "OFF"));
   appendItem(F("Control Mode"), String(kMotorControlMode));
+  appendItem(F("SD Card"), sdCardReady ? String(F("Ready")) : sdCardStatus);
   appendItem(F("Battery"), String(batteryVoltage, 2) + F(" V"));
   appendItem(F("Pulse Rate"), String(hallPulseHz, 2) + F(" Hz"));
   appendItem(F("Shaft Speed"), String(hallShaftRpm, 1) + F(" rpm"));
@@ -297,6 +300,65 @@ void logStartupBanner() {
   const float dividerRatio =
     (kBatteryDividerTopOhms + kBatteryDividerBottomOhms) / kBatteryDividerBottomOhms;
   Serial.println(dividerRatio, 4);
+  Serial.print("SD SPI pins (CS/SCK/MOSI/MISO): ");
+  Serial.print(kSdCardCsPin);
+  Serial.print('/');
+  Serial.print(kSdCardSckPin);
+  Serial.print('/');
+  Serial.print(kSdCardMosiPin);
+  Serial.print('/');
+  Serial.println(kSdCardMisoPin);
+}
+
+bool runSdCardSelfTest() {
+  File testFile = SD.open(kSdCardTestFile, FILE_WRITE);
+  if (!testFile) {
+    sdCardStatus = "test_open_failed";
+    return false;
+  }
+
+  testFile.println("Stirling Control Panel SD test");
+  testFile.close();
+
+  testFile = SD.open(kSdCardTestFile, FILE_READ);
+  if (!testFile) {
+    sdCardStatus = "test_read_failed";
+    return false;
+  }
+
+  const String content = testFile.readString();
+  testFile.close();
+  if (content.indexOf("SD test") < 0) {
+    sdCardStatus = "test_verify_failed";
+    return false;
+  }
+
+  if (!SD.exists(kSdCardDistanceFile)) {
+    File distanceFile = SD.open(kSdCardDistanceFile, FILE_WRITE);
+    if (!distanceFile) {
+      sdCardStatus = "distance_file_failed";
+      return false;
+    }
+    distanceFile.println("0.000");
+    distanceFile.close();
+  }
+
+  sdCardStatus = "mounted_tested";
+  return true;
+}
+
+void initSdCard() {
+  sdSpi.begin(kSdCardSckPin, kSdCardMisoPin, kSdCardMosiPin, kSdCardCsPin);
+  if (!SD.begin(kSdCardCsPin, sdSpi, kSdCardSpiFrequencyHz)) {
+    sdCardReady = false;
+    sdCardStatus = "mount_failed";
+    Serial.println("SD card mount failed.");
+    return;
+  }
+
+  sdCardReady = runSdCardSelfTest();
+  Serial.print("SD card status: ");
+  Serial.println(sdCardStatus);
 }
 
 void initBatterySense() {
@@ -397,6 +459,7 @@ void setup() {
   initOled();
   initHallSensor();
   initBatterySense();
+  initSdCard();
   setStatusLed(false);
   logStartupBanner();
   startAccessPoint();
@@ -427,6 +490,8 @@ void loop() {
     Serial.print(hallSpeedKmh, 2);
     Serial.print(", battery_v=");
     Serial.print(batteryVoltage, 2);
+    Serial.print(", sd=");
+    Serial.print(sdCardStatus);
     Serial.print(", pulse_total=");
     Serial.print(pulseTotal);
     Serial.print(", pulse_delta=");
