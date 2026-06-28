@@ -37,13 +37,24 @@ constexpr uint8_t kOledWidth = STIRLING_OLED_WIDTH;
 constexpr uint8_t kOledHeight = STIRLING_OLED_HEIGHT;
 constexpr unsigned long kOledTestPatternHoldMs = 750;
 
-// Stepper bench-test settings (4-wire stepper via IN1..IN4 driver module).
-constexpr uint8_t kStepperIn1Pin = 4;
-constexpr uint8_t kStepperIn2Pin = 5;
-constexpr uint8_t kStepperIn3Pin = 6;
-constexpr uint8_t kStepperIn4Pin = 7;
-constexpr long kStepperStepsPerRevolution = 2048;
-constexpr long kGaugeSweepDegrees = 270;
-constexpr unsigned long kForwardSweepMs = 1000;
-constexpr unsigned long kPauseAtLimitMs = 1000;
-constexpr unsigned long kReverseSweepMs = 500;
+// Velocity hall sensor input configuration.
+constexpr uint8_t kHallSensorPin = 4;
+constexpr bool kHallSensorUsePullup = true;
+constexpr bool kHallSensorActiveLow = true;
+constexpr uint8_t kHallPulsesPerRevolution = 4;
+// Sensor on 15T sprocket driving 20T wheel sprocket: shaft/wheel rpm = 20/15.
+constexpr float kHallShaftToWheelRatio = 20.0f / 15.0f;
+constexpr float kDriveWheelDiameterInches = 8.0f;
+constexpr float kDriveWheelDiameterMeters = kDriveWheelDiameterInches * 0.0254f;
+constexpr unsigned long kHallSampleIntervalMs = 250;
+constexpr unsigned long kHallMinPulseGapUs = 1000;
+
+// Battery voltage monitor (pre-buck) via resistor divider to ESP32 ADC.
+constexpr uint8_t kBatteryAdcPin = 1;
+constexpr unsigned long kBatterySampleIntervalMs = 500;
+constexpr uint8_t kBatteryAdcSamples = 16;
+// Using available values: top = 10k + 4.7k, bottom = 1k.
+constexpr float kBatteryDividerTopOhms = 14700.0f;
+constexpr float kBatteryDividerBottomOhms = 1000.0f;
+constexpr float kBatteryAdcReferenceVolts = 3.3f;
+constexpr float kBatteryCalibrationFactor = 1.1284f;

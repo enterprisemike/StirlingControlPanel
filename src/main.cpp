@@ -2,7 +2,6 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 #include <Adafruit_SSD1306.h>
-#include <AccelStepper.h>
 #include <Wire.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -17,45 +16,31 @@ Adafruit_SH1106G oled(kOledWidth, kOledHeight, &Wire, -1);
 #else
 Adafruit_SSD1306 oled(kOledWidth, kOledHeight, &Wire, -1);
 #endif
-AccelStepper gaugeStepper(
-  AccelStepper::FULL4WIRE,
-  kStepperIn1Pin,
-  kStepperIn3Pin,
-  kStepperIn2Pin,
-  kStepperIn4Pin);
+const char kMotorControlMode[] = "io_expander_planned";
 
-enum class StepperTestState {
-  ForwardSweep,
-  PauseAtMax,
-  ReverseSweep,
-  PauseAtMin
-};
-
-StepperTestState stepperState = StepperTestState::ForwardSweep;
-unsigned long stepperStateStartMs = 0;
-const long kSweepSteps = (kStepperStepsPerRevolution * kGaugeSweepDegrees) / 360;
-const float kForwardSpeedStepsPerSec =
-  static_cast<float>(kSweepSteps) / (static_cast<float>(kForwardSweepMs) / 1000.0f);
-const float kReverseSpeedStepsPerSec =
-  static_cast<float>(kSweepSteps) / (static_cast<float>(kReverseSweepMs) / 1000.0f);
-const char kStepperPresenceStatus[] = "not_verifiable_without_feedback";
+volatile uint32_t hallPulseCount = 0;
+volatile unsigned long hallLastPulseUs = 0;
+uint32_t hallPulseCountSnapshot = 0;
+uint32_t lastHeartbeatPulseCount = 0;
+unsigned long lastHallSampleMs = 0;
+float hallPulseHz = 0.0f;
+float hallShaftRpm = 0.0f;
+float hallSpeedKmh = 0.0f;
+unsigned long lastBatterySampleMs = 0;
+float batteryVoltage = 0.0f;
 
 unsigned long lastHeartbeatMs = 0;
 bool ledState = false;
 bool oledReady = false;
 
-const __FlashStringHelper *stepperStateLabel(StepperTestState state) {
-  switch (state) {
-    case StepperTestState::ForwardSweep:
-      return F("forward_sweep");
-    case StepperTestState::PauseAtMax:
-      return F("pause_at_max");
-    case StepperTestState::ReverseSweep:
-      return F("reverse_sweep");
-    case StepperTestState::PauseAtMin:
-      return F("pause_at_min");
+void IRAM_ATTR onHallPulse() {
+  const unsigned long nowUs = micros();
+  if ((nowUs - hallLastPulseUs) < kHallMinPulseGapUs) {
+    return;
   }
-  return F("unknown");
+
+  hallLastPulseUs = nowUs;
+  ++hallPulseCount;
 }
 
 void scanI2cBus() {
@@ -110,6 +95,11 @@ void renderOledStatus() {
     return;
   }
 
+  uint32_t pulseTotal = 0;
+  noInterrupts();
+  pulseTotal = hallPulseCount;
+  interrupts();
+
   oled.clearDisplay();
   oled.setTextColor(SH110X_WHITE);
 
@@ -137,6 +127,14 @@ void renderOledStatus() {
   oled.println();
   oled.print(F("IP "));
   oled.println(WiFi.softAPIP());
+  oled.print(F("SPD "));
+  oled.print(hallSpeedKmh, 1);
+  oled.println(F(" km/h"));
+  oled.print(F("BAT "));
+  oled.print(batteryVoltage, 1);
+  oled.println(F(" V"));
+  oled.print(F("PLS "));
+  oled.println(pulseTotal);
 #endif
 
   oled.display();
@@ -179,14 +177,31 @@ String formatUptime(unsigned long uptimeMs) {
 }
 
 String buildStatusJson() {
+  uint32_t pulseTotal = 0;
+  unsigned long lastPulseUs = 0;
+  noInterrupts();
+  pulseTotal = hallPulseCount;
+  lastPulseUs = hallLastPulseUs;
+  interrupts();
+
+  unsigned long lastPulseMsAgo = 0;
+  if (lastPulseUs > 0) {
+    lastPulseMsAgo = (micros() - lastPulseUs) / 1000;
+  }
+
   String json = "{";
   json += "\"firmware\":\"" + String(kFirmwareVersion) + "\",";
   json += "\"uptime_ms\":" + String(millis()) + ",";
   json += "\"uptime\":\"" + formatUptime(millis()) + "\",";
   json += "\"heartbeat_ms\":" + String(kHeartbeatIntervalMs) + ",";
   json += "\"led_state\":\"" + String(ledState ? "on" : "off") + "\",";
-  json += "\"stepper_state\":\"" + String(stepperStateLabel(stepperState)) + "\",";
-  json += "\"stepper_driver_presence\":\"" + String(kStepperPresenceStatus) + "\",";
+  json += "\"motor_control_mode\":\"" + String(kMotorControlMode) + "\",";
+  json += "\"battery_voltage\":" + String(batteryVoltage, 2) + ",";
+  json += "\"hall_total_pulses\":" + String(pulseTotal) + ",";
+  json += "\"hall_last_pulse_ms_ago\":" + String(lastPulseMsAgo) + ",";
+  json += "\"hall_pulse_hz\":" + String(hallPulseHz, 2) + ",";
+  json += "\"hall_shaft_rpm\":" + String(hallShaftRpm, 2) + ",";
+  json += "\"speed_kmh\":" + String(hallSpeedKmh, 2) + ",";
   json += "\"ap_ssid\":\"" + String(kApSsid) + "\",";
   json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
   json += "\"station_count\":" + String(WiFi.softAPgetStationNum());
@@ -219,8 +234,11 @@ String buildDashboardPage() {
   appendItem(F("Uptime"), formatUptime(millis()));
   appendItem(F("Heartbeat"), String(kHeartbeatIntervalMs) + F(" ms"));
   appendItem(F("LED State"), String(ledState ? "ON" : "OFF"));
-  appendItem(F("Stepper State"), String(stepperStateLabel(stepperState)));
-  appendItem(F("Stepper Driver Presence"), String(kStepperPresenceStatus));
+  appendItem(F("Control Mode"), String(kMotorControlMode));
+  appendItem(F("Battery"), String(batteryVoltage, 2) + F(" V"));
+  appendItem(F("Pulse Rate"), String(hallPulseHz, 2) + F(" Hz"));
+  appendItem(F("Shaft Speed"), String(hallShaftRpm, 1) + F(" rpm"));
+  appendItem(F("Estimated Speed"), String(hallSpeedKmh, 2) + F(" km/h"));
   appendItem(F("AP SSID"), String(kApSsid));
   appendItem(F("AP IP"), WiFi.softAPIP().toString());
   appendItem(F("Connected Clients"), String(WiFi.softAPgetStationNum()));
@@ -261,60 +279,96 @@ void logStartupBanner() {
     Serial.print('0');
   }
   Serial.println(kOledI2cAddress, HEX);
-  Serial.print("Stepper sweep steps (270 deg): ");
-  Serial.println(kSweepSteps);
-  Serial.print("Stepper driver presence detection: ");
-  Serial.println(kStepperPresenceStatus);
+  Serial.print("OLED resolution: ");
+  Serial.print(kOledWidth);
+  Serial.print('x');
+  Serial.println(kOledHeight);
+  Serial.print("Hall pin: ");
+  Serial.println(kHallSensorPin);
+  Serial.print("Hall pulses per shaft rev: ");
+  Serial.println(kHallPulsesPerRevolution);
+  Serial.print("Hall shaft-to-wheel ratio: ");
+  Serial.println(kHallShaftToWheelRatio, 4);
+  Serial.print("Wheel diameter (in): ");
+  Serial.println(kDriveWheelDiameterInches, 2);
+  Serial.print("Battery ADC pin: ");
+  Serial.println(kBatteryAdcPin);
+  Serial.print("Battery divider ratio: ");
+  const float dividerRatio =
+    (kBatteryDividerTopOhms + kBatteryDividerBottomOhms) / kBatteryDividerBottomOhms;
+  Serial.println(dividerRatio, 4);
 }
 
-void startStepperTest() {
-  gaugeStepper.setMaxSpeed(kReverseSpeedStepsPerSec + 200.0f);
-  gaugeStepper.setSpeed(kForwardSpeedStepsPerSec);
-  gaugeStepper.setCurrentPosition(0);
-  stepperState = StepperTestState::ForwardSweep;
-  stepperStateStartMs = millis();
-  Serial.println("Stepper test started: 1.0s forward, 1.0s pause, 0.5s return, 1.0s pause.");
+void initBatterySense() {
+  pinMode(kBatteryAdcPin, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(kBatteryAdcPin, ADC_11db);
+  lastBatterySampleMs = millis();
+  Serial.println("Battery voltage sensing initialized.");
 }
 
-void updateStepperTest() {
-  const unsigned long now = millis();
-  const unsigned long elapsedMs = now - stepperStateStartMs;
-
-  switch (stepperState) {
-    case StepperTestState::ForwardSweep:
-      gaugeStepper.setSpeed(kForwardSpeedStepsPerSec);
-      gaugeStepper.runSpeed();
-      if (elapsedMs >= kForwardSweepMs) {
-        gaugeStepper.setCurrentPosition(kSweepSteps);
-        stepperState = StepperTestState::PauseAtMax;
-        stepperStateStartMs = now;
-      }
-      break;
-
-    case StepperTestState::PauseAtMax:
-      if (elapsedMs >= kPauseAtLimitMs) {
-        stepperState = StepperTestState::ReverseSweep;
-        stepperStateStartMs = now;
-      }
-      break;
-
-    case StepperTestState::ReverseSweep:
-      gaugeStepper.setSpeed(-kReverseSpeedStepsPerSec);
-      gaugeStepper.runSpeed();
-      if (elapsedMs >= kReverseSweepMs) {
-        gaugeStepper.setCurrentPosition(0);
-        stepperState = StepperTestState::PauseAtMin;
-        stepperStateStartMs = now;
-      }
-      break;
-
-    case StepperTestState::PauseAtMin:
-      if (elapsedMs >= kPauseAtLimitMs) {
-        stepperState = StepperTestState::ForwardSweep;
-        stepperStateStartMs = now;
-      }
-      break;
+void updateBatteryVoltage() {
+  const unsigned long nowMs = millis();
+  if ((nowMs - lastBatterySampleMs) < kBatterySampleIntervalMs) {
+    return;
   }
+  lastBatterySampleMs = nowMs;
+
+  uint32_t rawSum = 0;
+  for (uint8_t i = 0; i < kBatteryAdcSamples; ++i) {
+    rawSum += static_cast<uint32_t>(analogRead(kBatteryAdcPin));
+  }
+
+  const float rawAvg = static_cast<float>(rawSum) / static_cast<float>(kBatteryAdcSamples);
+  const float adcVolts = (rawAvg / 4095.0f) * kBatteryAdcReferenceVolts;
+  const float dividerRatio =
+    (kBatteryDividerTopOhms + kBatteryDividerBottomOhms) / kBatteryDividerBottomOhms;
+  batteryVoltage = adcVolts * dividerRatio * kBatteryCalibrationFactor;
+
+  renderOledStatus();
+}
+
+void initHallSensor() {
+  pinMode(kHallSensorPin, kHallSensorUsePullup ? INPUT_PULLUP : INPUT);
+  attachInterrupt(
+    digitalPinToInterrupt(kHallSensorPin),
+    onHallPulse,
+    kHallSensorActiveLow ? FALLING : RISING);
+
+  lastHallSampleMs = millis();
+  Serial.println("Hall velocity sensor initialized.");
+}
+
+void updateHallVelocity() {
+  const unsigned long nowMs = millis();
+  const unsigned long elapsedMs = nowMs - lastHallSampleMs;
+  if (elapsedMs < kHallSampleIntervalMs) {
+    return;
+  }
+
+  noInterrupts();
+  const uint32_t currentPulseCount = hallPulseCount;
+  interrupts();
+
+  const uint32_t deltaPulses = currentPulseCount - hallPulseCountSnapshot;
+  hallPulseCountSnapshot = currentPulseCount;
+  lastHallSampleMs = nowMs;
+
+  if (elapsedMs == 0 || kHallPulsesPerRevolution == 0 || kHallShaftToWheelRatio <= 0.0f) {
+    hallPulseHz = 0.0f;
+    hallShaftRpm = 0.0f;
+    hallSpeedKmh = 0.0f;
+    return;
+  }
+
+  hallPulseHz = (static_cast<float>(deltaPulses) * 1000.0f) / static_cast<float>(elapsedMs);
+  hallShaftRpm = (hallPulseHz * 60.0f) / static_cast<float>(kHallPulsesPerRevolution);
+
+  const float wheelRpm = hallShaftRpm / kHallShaftToWheelRatio;
+  const float speedMetersPerSecond = (wheelRpm * PI * kDriveWheelDiameterMeters) / 60.0f;
+  hallSpeedKmh = speedMetersPerSecond * 3.6f;
+
+  renderOledStatus();
 }
 
 void startAccessPoint() {
@@ -341,15 +395,17 @@ void setup() {
   Serial.begin(kSerialBaudRate);
   delay(200);
   initOled();
+  initHallSensor();
+  initBatterySense();
   setStatusLed(false);
   logStartupBanner();
   startAccessPoint();
-  startStepperTest();
 }
 
 void loop() {
   server.handleClient();
-  updateStepperTest();
+  updateHallVelocity();
+  updateBatteryVoltage();
 
   const unsigned long now = millis();
 
@@ -357,9 +413,23 @@ void loop() {
     lastHeartbeatMs = now;
     setStatusLed(!ledState);
 
+    noInterrupts();
+    const uint32_t pulseTotal = hallPulseCount;
+    interrupts();
+    const uint32_t pulseDelta = pulseTotal - lastHeartbeatPulseCount;
+    lastHeartbeatPulseCount = pulseTotal;
+
     Serial.print("Heartbeat ms=");
     Serial.print(now);
     Serial.print(", led=");
-    Serial.println(ledState ? "ON" : "OFF");
+    Serial.print(ledState ? "ON" : "OFF");
+    Serial.print(", speed_kmh=");
+    Serial.print(hallSpeedKmh, 2);
+    Serial.print(", battery_v=");
+    Serial.print(batteryVoltage, 2);
+    Serial.print(", pulse_total=");
+    Serial.print(pulseTotal);
+    Serial.print(", pulse_delta=");
+    Serial.println(pulseDelta);
   }
 }
