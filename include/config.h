@@ -47,7 +47,7 @@ constexpr float kHallShaftToWheelRatio = 20.0f / 15.0f;
 constexpr float kDriveWheelDiameterInches = 8.0f;
 constexpr float kDriveWheelDiameterMeters = kDriveWheelDiameterInches * 0.0254f;
 constexpr unsigned long kHallSampleIntervalMs = 250;
-constexpr unsigned long kHallMinPulseGapUs = 1000;
+constexpr unsigned long kHallMinPulseGapUs = 25000;
 
 // Battery voltage monitor (pre-buck) via resistor divider to ESP32 ADC.
 constexpr uint8_t kBatteryAdcPin = 1;
@@ -65,6 +65,9 @@ constexpr uint8_t kSdCardSckPin = 11;
 constexpr uint8_t kSdCardMosiPin = 12;
 constexpr uint8_t kSdCardMisoPin = 13;
 constexpr uint32_t kSdCardSpiFrequencyHz = 1000000;
+constexpr unsigned long kSdCardPowerUpDelayMs = 500;
+constexpr unsigned long kSdCardRetryIntervalMs = 5000;
+constexpr uint8_t kSdCardMountAttemptsPerSpeed = 3;
 constexpr char kSdCardSoundsDir[] = "/sounds";
 constexpr char kSdCardLogsDir[] = "/logs";
 constexpr char kSdCardConfigDir[] = "/config";
@@ -72,3 +75,21 @@ constexpr char kSdCardSoundsReadmeFile[] = "/sounds/README.txt";
 constexpr char kSdCardTestFile[] = "/sd_test.txt";
 constexpr char kSdCardDistanceFile[] = "/distance_km.txt";
 constexpr char kSdCardBootLogFile[] = "/logs/boot.log";
+
+// I2S class-D amplifier wiring.
+constexpr uint8_t kAudioI2sLrcPin = 18;
+constexpr uint8_t kAudioI2sBclkPin = 17;
+constexpr uint8_t kAudioI2sDinPin = 16;
+constexpr uint8_t kAudioAmpSdPin = 7;
+constexpr bool kAudioAmpSdActiveHigh = true;
+constexpr uint32_t kAudioSampleRateHz = 44100;
+constexpr float kAudioDefaultVolume = 1.00f;
+constexpr bool kAudioHallUseGeneratedNoise = true;
+constexpr unsigned long kAudioNoiseBurstDurationMs = 220;
+constexpr float kAudioNoiseBurstVolume = 0.85f;
+constexpr bool kAudioStartupSoundEnabled = false;
+constexpr char kAudioStartupStreamFile[] = "/sounds/smooth operator riff.wav";
+constexpr char kAudioStartupTestFile[] = "/sounds/SteamSh.wav";
+constexpr size_t kAudioPlaybackBufferBytes = 1024;
+constexpr unsigned long kAudioStartupTestDurationMs = 5000;
+constexpr uint8_t kAudioStartupTestRateHz = 3;
