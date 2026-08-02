@@ -1,9 +1,11 @@
 #include <Arduino.h>
 #include <Adafruit_GFX.h>
+#include <RTClib.h>
 #include <Adafruit_SH110X.h>
 #include <Adafruit_SSD1306.h>
 #include <SD.h>
 #include <SPI.h>
+#include <TinyGPSPlus.h>
 #include <Wire.h>
 #include <cstring>
 #include <esp_heap_caps.h>
@@ -17,12 +19,16 @@ namespace {
 
 WebServer server(80);
 SPIClass sdSpi(FSPI);
+HardwareSerial gpsSerial(1);
+RTC_DS3231 rtc;
+TinyGPSPlus gps;
 #if STIRLING_OLED_DRIVER == STIRLING_OLED_DRIVER_SH1106
 Adafruit_SH1106G oled(kOledWidth, kOledHeight, &Wire, -1);
 #else
 Adafruit_SSD1306 oled(kOledWidth, kOledHeight, &Wire, -1);
 #endif
 const char kMotorControlMode[] = "io_expander_planned";
+const uint32_t kGpsCandidateBaudRates[] = {115200, 9600, 38400, 57600, 4800};
 
 volatile uint32_t hallPulseCount = 0;
 volatile uint32_t hallRejectedPulseCount = 0;
@@ -44,11 +50,43 @@ String audioStatus = "not_initialized";
 String startupStreamStatus = "not_run";
 uint32_t audioPlayRequests = 0;
 uint32_t audioPlayStarts = 0;
+uint8_t startupClipPlayCount = 0;
+unsigned long lastStartupClipPlayMs = 0;
 unsigned long lastSdRetryMs = 0;
+bool rtcReady = false;
+bool rtcTimeValid = false;
+bool rtcSetFromGps = false;
+String rtcStatus = "not_initialized";
+DateTime currentRtcTime(2000, 1, 1, 0, 0, 0);
+unsigned long lastRtcSampleMs = 0;
+unsigned long lastRtcGpsSyncMs = 0;
+bool gpsReady = false;
+bool gpsLocationValid = false;
+String gpsStatus = "not_initialized";
+double gpsLatitude = 0.0;
+double gpsLongitude = 0.0;
+double gpsAltitudeMeters = 0.0;
+double gpsSpeedKmph = 0.0;
+uint32_t gpsSatellites = 0;
+double gpsHdop = 0.0;
+unsigned long lastGpsLocationLogMs = 0;
+unsigned long lastGpsDisplayRefreshMs = 0;
+unsigned long lastGpsByteMs = 0;
+uint32_t gpsBytesThisBoot = 0;
+uint32_t gpsSentencesThisBoot = 0;
+uint32_t gpsFailedChecksumsThisBoot = 0;
+char gpsRawPreview[81] = "";
+uint8_t gpsRawPreviewLength = 0;
+uint8_t gpsBaudCandidateIndex = 0;
+uint32_t gpsActiveBaudRate = kGpsBaudRate;
+unsigned long lastGpsBaudProbeMs = 0;
+uint32_t gpsSentencesAtLastBaudProbe = 0;
+uint32_t gpsBytesAtLastBaudProbe = 0;
 
 unsigned long lastHeartbeatMs = 0;
 bool ledState = false;
 bool oledReady = false;
+String oledStatus = "not_initialized";
 
 struct WavInfo {
   uint16_t audioFormat = 0;
@@ -108,7 +146,26 @@ uint32_t audioNoiseRandomState = 0xA53C9E27UL;
 
 void renderOledStatus();
 
+void setStatusLed(bool enabled);
+
 void loadAudioAssetsAfterSdReady();
+
+struct ScopedStatusLed {
+  explicit ScopedStatusLed(bool enabled)
+    : active(enabled) {
+    if (active) {
+      setStatusLed(true);
+    }
+  }
+
+  ~ScopedStatusLed() {
+    if (active) {
+      setStatusLed(false);
+    }
+  }
+
+  bool active = false;
+};
 
 void setAudioAmpEnabled(bool enabled) {
   const uint8_t level =
@@ -305,6 +362,8 @@ bool loadWavFileToMemory(const char *path, LoadedAudioClip &clip, float volume) 
     audioStatus = "sd_not_ready";
     return false;
   }
+
+  ScopedStatusLed loadingLed(true);
 
   File wavFile = SD.open(path, FILE_READ);
   if (!wavFile) {
@@ -846,7 +905,6 @@ void serviceAudioPlayback() {
     audioPlaybackOffsetBytes = 0;
     audioStatus = doneStatus;
     if (wasStartup) {
-      startupClipPlayed = true;
       startupStreamStatus = doneStatus;
     }
     i2s_zero_dma_buffer(I2S_NUM_0);
@@ -910,30 +968,25 @@ void IRAM_ATTR onHallPulse() {
   ++hallPulseCount;
 }
 
-void scanI2cBus() {
-  Serial.println("I2C scan start");
+bool probeI2cAddress(uint8_t address) {
+  Wire.beginTransmission(address);
+  const uint8_t error = Wire.endTransmission();
 
-  uint8_t deviceCount = 0;
-  for (uint8_t address = 1; address < 127; ++address) {
-    Wire.beginTransmission(address);
-    const uint8_t error = Wire.endTransmission();
-
-    if (error == 0) {
-      Serial.print("I2C device found at 0x");
-      if (address < 16) {
-        Serial.print('0');
-      }
-      Serial.println(address, HEX);
-      ++deviceCount;
-    }
+  Serial.print("I2C probe 0x");
+  if (address < 16) {
+    Serial.print('0');
   }
+  Serial.print(address, HEX);
+  Serial.print(": ");
+  Serial.println(error == 0 ? "found" : "not found");
+  return error == 0;
+}
 
-  if (deviceCount == 0) {
-    Serial.println("I2C scan found no devices");
-  } else {
-    Serial.print("I2C scan found devices: ");
-    Serial.println(deviceCount);
-  }
+void probeExpectedI2cAddresses() {
+  Serial.println("I2C targeted diagnostic probes");
+  probeI2cAddress(kOledI2cAddress);
+  probeI2cAddress(0x57);
+  probeI2cAddress(0x68);
 }
 
 void runOledTestPattern() {
@@ -957,6 +1010,397 @@ void runOledTestPattern() {
   oled.display();
 }
 
+void recoverI2cBus() {
+  pinMode(kOledSdaPin, INPUT_PULLUP);
+  pinMode(kOledSclPin, INPUT_PULLUP);
+  delay(10);
+
+  if (digitalRead(kOledSdaPin) == HIGH && digitalRead(kOledSclPin) == HIGH) {
+    return;
+  }
+
+  Serial.println("I2C bus appears busy; attempting bus recovery.");
+  pinMode(kOledSclPin, OUTPUT_OPEN_DRAIN);
+  digitalWrite(kOledSclPin, HIGH);
+
+  for (uint8_t pulse = 0; pulse < 9 && digitalRead(kOledSdaPin) == LOW; ++pulse) {
+    digitalWrite(kOledSclPin, LOW);
+    delayMicroseconds(10);
+    digitalWrite(kOledSclPin, HIGH);
+    delayMicroseconds(10);
+  }
+
+  pinMode(kOledSdaPin, OUTPUT_OPEN_DRAIN);
+  digitalWrite(kOledSdaPin, LOW);
+  delayMicroseconds(10);
+  digitalWrite(kOledSclPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(kOledSdaPin, HIGH);
+  delayMicroseconds(10);
+
+  pinMode(kOledSdaPin, INPUT_PULLUP);
+  pinMode(kOledSclPin, INPUT_PULLUP);
+  Serial.print("I2C recovery complete, SDA/SCL: ");
+  Serial.print(digitalRead(kOledSdaPin));
+  Serial.print('/');
+  Serial.println(digitalRead(kOledSclPin));
+}
+
+String formatDateTimeUtc(const DateTime &dateTime) {
+  char buffer[24];
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%04u-%02u-%02uT%02u:%02u:%02uZ",
+    dateTime.year(),
+    dateTime.month(),
+    dateTime.day(),
+    dateTime.hour(),
+    dateTime.minute(),
+    dateTime.second());
+  return String(buffer);
+}
+
+uint8_t firstSundayOfMonth(uint16_t year, uint8_t month) {
+  const DateTime firstDay(year, month, 1, 0, 0, 0);
+  return 1 + ((7 - firstDay.dayOfTheWeek()) % 7);
+}
+
+bool isAustralianEasternDaylightTimeUtc(const DateTime &utcTime) {
+  if (!kAustralianEasternUseDaylightSavings) {
+    return false;
+  }
+
+  const uint16_t year = utcTime.year();
+  const uint32_t dstStartUtc = DateTime(
+    year,
+    10,
+    firstSundayOfMonth(year, 10),
+    2,
+    0,
+    0).unixtime() - kAustralianEasternStandardOffsetSeconds;
+  const uint32_t dstEndUtc = DateTime(
+    year,
+    4,
+    firstSundayOfMonth(year, 4),
+    3,
+    0,
+    0).unixtime() - kAustralianEasternDaylightOffsetSeconds;
+  const uint32_t unixTime = utcTime.unixtime();
+  return unixTime >= dstStartUtc || unixTime < dstEndUtc;
+}
+
+const __FlashStringHelper *australianEasternTimeAbbrev(const DateTime &utcTime) {
+  return isAustralianEasternDaylightTimeUtc(utcTime) ? F("AEDT") : F("AEST");
+}
+
+DateTime australianEasternTimeFromUtc(const DateTime &utcTime) {
+  const uint32_t offsetSeconds = isAustralianEasternDaylightTimeUtc(utcTime)
+    ? kAustralianEasternDaylightOffsetSeconds
+    : kAustralianEasternStandardOffsetSeconds;
+  return DateTime(utcTime.unixtime() + offsetSeconds);
+}
+
+String formatDateTimeAustralianEastern(const DateTime &utcTime) {
+  const DateTime localTime = australianEasternTimeFromUtc(utcTime);
+  char buffer[29];
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%04u-%02u-%02uT%02u:%02u:%02u %s",
+    localTime.year(),
+    localTime.month(),
+    localTime.day(),
+    localTime.hour(),
+    localTime.minute(),
+    localTime.second(),
+    isAustralianEasternDaylightTimeUtc(utcTime) ? "AEDT" : "AEST");
+  return String(buffer);
+}
+
+String formatOledTime() {
+  if (!rtcTimeValid) {
+    return String(F("AET --:--:--"));
+  }
+
+  const DateTime localTime = australianEasternTimeFromUtc(currentRtcTime);
+  char buffer[16];
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%s %02u:%02u:%02u",
+    isAustralianEasternDaylightTimeUtc(currentRtcTime) ? "AEDT" : "AEST",
+    localTime.hour(),
+    localTime.minute(),
+    localTime.second());
+  return String(buffer);
+}
+
+String formatGpsLocation() {
+  if (!gpsLocationValid) {
+    return String(F("GPS waiting"));
+  }
+
+  char buffer[32];
+  snprintf(buffer, sizeof(buffer), "%.5f,%.5f", gpsLatitude, gpsLongitude);
+  return String(buffer);
+}
+
+void updateRtcTime() {
+  const unsigned long nowMs = millis();
+  if (!rtcReady || (nowMs - lastRtcSampleMs) < kRtcSampleIntervalMs) {
+    return;
+  }
+
+  lastRtcSampleMs = nowMs;
+  currentRtcTime = rtc.now();
+  rtcTimeValid = !rtc.lostPower();
+  if (!rtcTimeValid) {
+    rtcStatus = "lost_power_waiting_gps";
+  }
+  renderOledStatus();
+}
+
+void initRtc() {
+  if (!probeI2cAddress(0x68)) {
+    rtcReady = false;
+    rtcTimeValid = false;
+    rtcStatus = "not_found";
+    Serial.println("RTC not found at I2C address 0x68.");
+    return;
+  }
+
+  if (!rtc.begin(&Wire)) {
+    rtcReady = false;
+    rtcTimeValid = false;
+    rtcStatus = "not_found";
+    Serial.println("RTC not found on I2C bus.");
+    return;
+  }
+
+  rtcReady = true;
+  const bool rtcLostPower = rtc.lostPower();
+  currentRtcTime = rtc.now();
+  rtcTimeValid = !rtcLostPower;
+  rtcStatus = rtcLostPower ? "lost_power_waiting_gps" : "running";
+  lastRtcSampleMs = millis();
+
+  Serial.print("RTC initialized, status/time: ");
+  Serial.print(rtcStatus);
+  Serial.print(' ');
+  Serial.println(rtcTimeValid ? formatDateTimeUtc(currentRtcTime) : String(F("unknown")));
+}
+
+void clearGpsRawPreview() {
+  gpsRawPreview[0] = '\0';
+  gpsRawPreviewLength = 0;
+}
+
+void startGpsSerial(uint32_t baudRate) {
+  gpsSerial.end();
+  gpsSerial.begin(baudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
+  gpsActiveBaudRate = baudRate;
+  lastGpsBaudProbeMs = millis();
+  gpsSentencesAtLastBaudProbe = gpsSentencesThisBoot;
+  gpsBytesAtLastBaudProbe = gpsBytesThisBoot;
+  clearGpsRawPreview();
+
+  Serial.print("GPS UART baud/RX/TX: ");
+  Serial.print(gpsActiveBaudRate);
+  Serial.print('/');
+  Serial.print(kGpsRxPin);
+  Serial.print('/');
+  Serial.println(kGpsTxPin);
+}
+
+void initGps() {
+  gpsReady = true;
+  gpsStatus = "waiting_for_fix";
+  startGpsSerial(kGpsCandidateBaudRates[gpsBaudCandidateIndex]);
+}
+
+void serviceGpsBaudProbe() {
+  if (!gpsReady || gpsSentencesThisBoot > 0) {
+    return;
+  }
+
+  const unsigned long nowMs = millis();
+  if ((nowMs - lastGpsBaudProbeMs) < kGpsBaudProbeIntervalMs) {
+    return;
+  }
+
+  gpsBaudCandidateIndex = (gpsBaudCandidateIndex + 1) %
+    (sizeof(kGpsCandidateBaudRates) / sizeof(kGpsCandidateBaudRates[0]));
+  gpsStatus = gpsBytesThisBoot > gpsBytesAtLastBaudProbe
+    ? "baud_probe_garbled"
+    : "baud_probe_no_data";
+  gpsSentencesAtLastBaudProbe = gpsSentencesThisBoot;
+  gpsBytesAtLastBaudProbe = gpsBytesThisBoot;
+  startGpsSerial(kGpsCandidateBaudRates[gpsBaudCandidateIndex]);
+}
+
+bool gpsDateTimeIsUsable() {
+  return gps.date.isValid() && gps.time.isValid() &&
+    gps.date.age() < 2000 && gps.time.age() < 2000;
+}
+
+DateTime gpsDateTimeUtc() {
+  return DateTime(
+    gps.date.year(),
+    gps.date.month(),
+    gps.date.day(),
+    gps.time.hour(),
+    gps.time.minute(),
+    gps.time.second());
+}
+
+void syncRtcFromGpsIfNeeded() {
+  if (!rtcReady || !gpsDateTimeIsUsable()) {
+    return;
+  }
+
+  const unsigned long nowMs = millis();
+  if (rtcSetFromGps && (nowMs - lastRtcGpsSyncMs) < kRtcGpsSyncIntervalMs) {
+    return;
+  }
+
+  const DateTime gpsTime = gpsDateTimeUtc();
+  const DateTime rtcTime = rtc.now();
+  const int64_t driftSeconds =
+    static_cast<int64_t>(gpsTime.unixtime()) - static_cast<int64_t>(rtcTime.unixtime());
+  const bool shouldSync = rtc.lostPower() || !rtcTimeValid || !rtcSetFromGps ||
+    llabs(driftSeconds) > kRtcMaxGpsDriftSeconds;
+
+  if (!shouldSync) {
+    return;
+  }
+
+  rtc.adjust(gpsTime);
+  currentRtcTime = gpsTime;
+  rtcTimeValid = true;
+  rtcSetFromGps = true;
+  lastRtcGpsSyncMs = nowMs;
+  rtcStatus = "synced_from_gps";
+
+  Serial.print("RTC set from GPS UTC: ");
+  Serial.println(formatDateTimeUtc(currentRtcTime));
+  Serial.print("Local time: ");
+  Serial.println(formatDateTimeAustralianEastern(currentRtcTime));
+  renderOledStatus();
+}
+
+void ensureGpsLogHeader() {
+  if (SD.exists(kGpsLocationLogFile)) {
+    return;
+  }
+
+  File logFile = SD.open(kGpsLocationLogFile, FILE_WRITE);
+  if (!logFile) {
+    return;
+  }
+
+  logFile.println("millis,utc,latitude,longitude,altitude_m,speed_kmph,satellites,hdop");
+  logFile.close();
+}
+
+void logGpsLocationIfNeeded() {
+  if (!sdCardReady || !gpsLocationValid) {
+    return;
+  }
+
+  const unsigned long nowMs = millis();
+  if ((nowMs - lastGpsLocationLogMs) < kGpsLocationLogIntervalMs) {
+    return;
+  }
+
+  ensureGpsLogHeader();
+  File logFile = SD.open(kGpsLocationLogFile, FILE_APPEND);
+  if (!logFile) {
+    gpsStatus = "log_open_failed";
+    return;
+  }
+
+  lastGpsLocationLogMs = nowMs;
+  logFile.print(nowMs);
+  logFile.print(',');
+  logFile.print(rtcTimeValid ? formatDateTimeUtc(currentRtcTime) : String(F("unknown")));
+  logFile.print(',');
+  logFile.print(gpsLatitude, 6);
+  logFile.print(',');
+  logFile.print(gpsLongitude, 6);
+  logFile.print(',');
+  logFile.print(gpsAltitudeMeters, 1);
+  logFile.print(',');
+  logFile.print(gpsSpeedKmph, 2);
+  logFile.print(',');
+  logFile.print(gpsSatellites);
+  logFile.print(',');
+  logFile.println(gpsHdop, 2);
+  logFile.close();
+}
+
+void serviceGps() {
+  if (!gpsReady) {
+    return;
+  }
+
+  bool decoded = false;
+  while (gpsSerial.available() > 0) {
+    const char gpsByte = static_cast<char>(gpsSerial.read());
+    ++gpsBytesThisBoot;
+    lastGpsByteMs = millis();
+    if (gpsRawPreviewLength >= (sizeof(gpsRawPreview) - 1)) {
+      memmove(gpsRawPreview, gpsRawPreview + 1, sizeof(gpsRawPreview) - 2);
+      gpsRawPreviewLength = sizeof(gpsRawPreview) - 2;
+    }
+    if (gpsByte == '\r') {
+      gpsRawPreview[gpsRawPreviewLength++] = '|';
+    } else if (gpsByte == '\n') {
+      gpsRawPreview[gpsRawPreviewLength++] = '/';
+    } else if (gpsByte >= 32 && gpsByte <= 126) {
+      gpsRawPreview[gpsRawPreviewLength++] = gpsByte;
+    } else {
+      gpsRawPreview[gpsRawPreviewLength++] = '.';
+    }
+    gpsRawPreview[gpsRawPreviewLength] = '\0';
+    decoded = gps.encode(gpsByte) || decoded;
+  }
+
+  gpsSentencesThisBoot = gps.passedChecksum();
+  gpsFailedChecksumsThisBoot = gps.failedChecksum();
+  serviceGpsBaudProbe();
+
+  if (!decoded) {
+    if (gpsBytesThisBoot > 0 && gpsStatus == "waiting_for_fix") {
+      gpsStatus = "receiving_no_fix";
+    }
+    return;
+  }
+
+  gpsSatellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  gpsHdop = gps.hdop.isValid() ? gps.hdop.hdop() : 0.0;
+
+  if (gps.location.isValid()) {
+    gpsLatitude = gps.location.lat();
+    gpsLongitude = gps.location.lng();
+    gpsAltitudeMeters = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+    gpsSpeedKmph = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+    gpsLocationValid = true;
+    gpsStatus = "fix";
+    logGpsLocationIfNeeded();
+  } else {
+    gpsStatus = gpsSentencesThisBoot > 0 ? "nmea_no_fix" : "waiting_for_fix";
+  }
+
+  syncRtcFromGpsIfNeeded();
+
+  const unsigned long nowMs = millis();
+  if ((nowMs - lastGpsDisplayRefreshMs) >= kGpsDisplayRefreshMs) {
+    lastGpsDisplayRefreshMs = nowMs;
+    renderOledStatus();
+  }
+}
+
 void renderOledStatus() {
   if (!oledReady) {
     return;
@@ -966,21 +1410,20 @@ void renderOledStatus() {
   oled.setTextColor(SH110X_WHITE);
 
 #if STIRLING_OLED_HEIGHT <= 32
-  oled.setTextSize(2);
-  oled.setCursor(0, 0);
-  oled.print(F("LED "));
-  oled.println(ledState ? F("ON") : F("OFF"));
-
   oled.setTextSize(1);
-  oled.setCursor(0, 24);
-  oled.print(F("IP "));
-  oled.println(WiFi.softAPIP());
+  oled.setCursor(0, 0);
+  oled.println(formatOledTime());
+  oled.println(formatGpsLocation());
+  oled.print(F("BAT "));
+  oled.print(batteryVoltage, 1);
+  oled.print(F("V SPD "));
+  oled.print(hallSpeedKmh, 1);
 #else
   oled.setTextSize(1);
   oled.setCursor(0, 0);
   oled.println(F("Stirling Panel"));
-  oled.print(F("IP "));
-  oled.println(WiFi.softAPIP());
+  oled.println(formatOledTime());
+  oled.println(formatGpsLocation());
   oled.print(F("BAT "));
   oled.print(batteryVoltage, 1);
   oled.print(F("V SD "));
@@ -988,15 +1431,11 @@ void renderOledStatus() {
   oled.print(F("SPD "));
   oled.print(hallSpeedKmh, 1);
   oled.println(F(" kmh"));
-  oled.print(F("I2S "));
-  oled.print(kAudioI2sLrcPin);
-  oled.print('/');
-  oled.print(kAudioI2sBclkPin);
-  oled.print('/');
-  oled.println(kAudioI2sDinPin);
-  oled.print(F("AMP "));
-  oled.print(kAudioAmpSdPin);
-  oled.print(' ');
+  oled.print(F("GPS "));
+  oled.print(gpsLocationValid ? F("FIX") : F("WAIT"));
+  oled.print(F(" SAT "));
+  oled.println(gpsSatellites);
+  oled.print(F("AUD "));
   if (audioStatus == "playing_ram" || audioStatus == "playing_noise") {
     oled.println(F("PLAY"));
   } else if (audioStatus == "ram_ready" || audioStatus == "noise_ready" || audioStatus == "startup_stream_done") {
@@ -1004,8 +1443,6 @@ void renderOledStatus() {
   } else {
     oled.println(F("ERR"));
   }
-  oled.print(F("LED "));
-  oled.println(ledState ? F("ON") : F("OFF"));
 #endif
 
   oled.display();
@@ -1018,8 +1455,14 @@ void setStatusLed(bool enabled) {
 }
 
 void initOled() {
+  Serial.println("Initializing I2C/OLED bus...");
+  recoverI2cBus();
   Wire.begin(kOledSdaPin, kOledSclPin);
-  scanI2cBus();
+  Wire.setClock(kI2cClockHz);
+  Wire.setTimeOut(kI2cTimeoutMs);
+  const bool oledAddressFound = probeI2cAddress(kOledI2cAddress);
+  oledStatus = oledAddressFound ? "address_found" : "address_not_found";
+  probeExpectedI2cAddresses();
 
 #if STIRLING_OLED_DRIVER == STIRLING_OLED_DRIVER_SH1106
   if (!oled.begin(kOledI2cAddress, true)) {
@@ -1027,10 +1470,13 @@ void initOled() {
   if (!oled.begin(SSD1306_SWITCHCAPVCC, kOledI2cAddress)) {
 #endif
     Serial.println("OLED init failed");
+    oledStatus = "begin_failed";
     return;
   }
 
+  Serial.println("OLED initialized.");
   oledReady = true;
+  oledStatus = "ready";
   runOledTestPattern();
   renderOledStatus();
 }
@@ -1068,7 +1514,31 @@ String buildStatusJson() {
   json += "\"uptime\":\"" + formatUptime(millis()) + "\",";
   json += "\"heartbeat_ms\":" + String(kHeartbeatIntervalMs) + ",";
   json += "\"led_state\":\"" + String(ledState ? "on" : "off") + "\",";
+  json += "\"oled_ready\":" + String(oledReady ? "true" : "false") + ",";
+  json += "\"oled_status\":\"" + oledStatus + "\",";
   json += "\"motor_control_mode\":\"" + String(kMotorControlMode) + "\",";
+  json += "\"rtc_ready\":" + String(rtcReady ? "true" : "false") + ",";
+  json += "\"rtc_status\":\"" + rtcStatus + "\",";
+  json += "\"rtc_time_utc\":\"" + String(rtcTimeValid ? formatDateTimeUtc(currentRtcTime) : String(F("unknown"))) + "\",";
+  json += "\"rtc_time_local\":\"" + String(rtcTimeValid ? formatDateTimeAustralianEastern(currentRtcTime) : String(F("unknown"))) + "\",";
+  json += "\"rtc_timezone\":\"" + String(rtcTimeValid ? australianEasternTimeAbbrev(currentRtcTime) : F("AET")) + "\",";
+  json += "\"rtc_set_from_gps\":" + String(rtcSetFromGps ? "true" : "false") + ",";
+  json += "\"gps_ready\":" + String(gpsReady ? "true" : "false") + ",";
+  json += "\"gps_status\":\"" + gpsStatus + "\",";
+  json += "\"gps_baud\":" + String(gpsActiveBaudRate) + ",";
+  json += "\"gps_bytes\":" + String(gpsBytesThisBoot) + ",";
+  json += "\"gps_sentences\":" + String(gpsSentencesThisBoot) + ",";
+  json += "\"gps_checksum_failures\":" + String(gpsFailedChecksumsThisBoot) + ",";
+  json += "\"gps_last_byte_ms_ago\":" + String(lastGpsByteMs > 0 ? millis() - lastGpsByteMs : 0) + ",";
+  json += "\"gps_raw_preview\":\"" + String(gpsRawPreview) + "\",";
+  json += "\"gps_fix\":" + String(gpsLocationValid ? "true" : "false") + ",";
+  json += "\"gps_latitude\":" + String(gpsLatitude, 6) + ",";
+  json += "\"gps_longitude\":" + String(gpsLongitude, 6) + ",";
+  json += "\"gps_altitude_m\":" + String(gpsAltitudeMeters, 1) + ",";
+  json += "\"gps_speed_kmph\":" + String(gpsSpeedKmph, 2) + ",";
+  json += "\"gps_satellites\":" + String(gpsSatellites) + ",";
+  json += "\"gps_hdop\":" + String(gpsHdop, 2) + ",";
+  json += "\"gps_log_file\":\"" + String(kGpsLocationLogFile) + "\",";
   json += "\"sd_ready\":" + String(sdCardReady ? "true" : "false") + ",";
   json += "\"sd_status\":\"" + sdCardStatus + "\",";
   json += "\"sd_spi_frequency_hz\":" + String(sdCardActiveSpiFrequencyHz) + ",";
@@ -1126,8 +1596,20 @@ String buildDashboardPage() {
   appendItem(F("Firmware"), String(kFirmwareVersion));
   appendItem(F("Uptime"), formatUptime(millis()));
   appendItem(F("Heartbeat"), String(kHeartbeatIntervalMs) + F(" ms"));
-  appendItem(F("LED State"), String(ledState ? "ON" : "OFF"));
+  appendItem(F("OLED"), oledReady ? String(F("Ready")) : oledStatus);
   appendItem(F("Control Mode"), String(kMotorControlMode));
+  appendItem(F("RTC"), rtcReady ? rtcStatus : String(F("Not found")));
+  appendItem(F("Local Time"), rtcTimeValid ? formatDateTimeAustralianEastern(currentRtcTime) : String(F("Unknown")));
+  appendItem(F("UTC Time"), rtcTimeValid ? formatDateTimeUtc(currentRtcTime) : String(F("Unknown")));
+  appendItem(F("GPS"), gpsLocationValid ? String(F("Fix")) : gpsStatus);
+  appendItem(F("GPS Baud"), String(gpsActiveBaudRate));
+  appendItem(F("Location"), gpsLocationValid ? formatGpsLocation() : String(F("Waiting")));
+  appendItem(F("GPS Detail"), String(gpsSatellites) + F(" sats / HDOP ") + String(gpsHdop, 2));
+  appendItem(
+    F("GPS Serial"),
+    String(gpsBytesThisBoot) + F(" bytes / ") + String(gpsSentencesThisBoot) +
+      F(" ok / ") + String(gpsFailedChecksumsThisBoot) + F(" bad"));
+  appendItem(F("GPS Log"), String(kGpsLocationLogFile));
   appendItem(F("SD Card"), sdCardReady ? String(F("Ready")) : sdCardStatus);
   appendItem(F("SD SPI"), String(sdCardActiveSpiFrequencyHz) + F(" Hz"));
   appendItem(F("Audio"), audioStatus);
@@ -1210,6 +1692,20 @@ void logStartupBanner() {
   const float dividerRatio =
     (kBatteryDividerTopOhms + kBatteryDividerBottomOhms) / kBatteryDividerBottomOhms;
   Serial.println(dividerRatio, 4);
+  Serial.print("RTC status/time: ");
+  Serial.print(rtcStatus);
+  Serial.print('/');
+  Serial.println(rtcTimeValid ? formatDateTimeUtc(currentRtcTime) : String(F("unknown")));
+  Serial.print("GPS baud/RX/TX/status: ");
+  Serial.print(gpsActiveBaudRate);
+  Serial.print('/');
+  Serial.print(kGpsRxPin);
+  Serial.print('/');
+  Serial.print(kGpsTxPin);
+  Serial.print('/');
+  Serial.println(gpsStatus);
+  Serial.print("GPS log file: ");
+  Serial.println(kGpsLocationLogFile);
   Serial.print("SD SPI pins (CS/SCK/MOSI/MISO): ");
   Serial.print(kSdCardCsPin);
   Serial.print('/');
@@ -1316,6 +1812,8 @@ bool runSdCardSelfTest() {
     distanceFile.println("0.000");
     distanceFile.close();
   }
+
+  ensureGpsLogHeader();
 
   File bootLogFile = SD.open(kSdCardBootLogFile, FILE_APPEND);
   if (!bootLogFile) {
@@ -1428,6 +1926,7 @@ void resetAudioLoadJob() {
     heap_caps_free(audioLoadJob.samples);
   }
   audioLoadJob = AudioLoadJob{};
+  setStatusLed(false);
 }
 
 bool beginAudioLoadJob(const char *path, LoadedAudioClip &clip) {
@@ -1437,6 +1936,7 @@ bool beginAudioLoadJob(const char *path, LoadedAudioClip &clip) {
   }
 
   resetAudioLoadJob();
+  setStatusLed(true);
   audioLoadJob.file = SD.open(path, FILE_READ);
   if (!audioLoadJob.file) {
     audioStatus = "wav_open_failed";
@@ -1564,6 +2064,7 @@ bool serviceAudioLoadJob() {
   audioLoadJob.file.close();
   audioLoadJob = AudioLoadJob{};
   audioStatus = "ram_ready";
+  setStatusLed(false);
   return true;
 }
 
@@ -1612,17 +2113,33 @@ void serviceAudioAssetLoading() {
   }
 
   if (audioAssetLoadStage == AudioAssetLoadStage::PlayStartup) {
-    if (!startupClipPlayed) {
-      startupStreamStatus = startLoadedClipPlayback(
-        startupClip,
-        "playing_startup_ram",
-        "startup_ram_done",
-        true,
-        false)
-        ? "playing_startup_ram"
-        : audioStatus;
+    if (startupClipPlayCount < kAudioStartupPlayCount) {
+      const unsigned long nowMs = millis();
+      if (startupClipPlayCount > 0 &&
+          (nowMs - lastStartupClipPlayMs) < kAudioStartupPlayIntervalMs) {
+        return;
+      }
+
+      if (!startLoadedClipPlayback(
+          startupClip,
+          "playing_startup_ram",
+          "startup_ram_ready",
+          true,
+          false)) {
+        startupStreamStatus = audioStatus;
+        startupClipPlayed = true;
+        audioAssetLoadStage = AudioAssetLoadStage::Done;
+        return;
+      }
+
+      ++startupClipPlayCount;
+      lastStartupClipPlayMs = nowMs;
+      startupStreamStatus = "playing_startup_ram";
       return;
     }
+
+    startupClipPlayed = true;
+    startupStreamStatus = "startup_sequence_done";
     audioAssetLoadStage = AudioAssetLoadStage::Done;
   }
 }
@@ -1737,7 +2254,11 @@ void setup() {
 
   Serial.begin(kSerialBaudRate);
   delay(200);
+  Serial.println();
+  Serial.println("Stirling Control Panel boot start");
   initOled();
+  initRtc();
+  initGps();
   initHallSensor();
   initBatterySense();
   initSdCard();
@@ -1749,10 +2270,12 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  serviceGps();
   handleHallAudioTriggers();
   serviceAudioPlayback();
   retrySdCardIfNeeded();
   serviceAudioAssetLoading();
+  updateRtcTime();
   updateHallVelocity();
   updateBatteryVoltage();
 
@@ -1760,7 +2283,6 @@ void loop() {
 
   if (now - lastHeartbeatMs >= kHeartbeatIntervalMs) {
     lastHeartbeatMs = now;
-    setStatusLed(!ledState);
 
     noInterrupts();
     const uint32_t pulseTotal = hallPulseCount;
@@ -1773,10 +2295,44 @@ void loop() {
     Serial.print(now);
     Serial.print(", led=");
     Serial.print(ledState ? "ON" : "OFF");
+    Serial.print(", oled=");
+    Serial.print(oledStatus);
     Serial.print(", speed_kmh=");
     Serial.print(hallSpeedKmh, 2);
     Serial.print(", battery_v=");
     Serial.print(batteryVoltage, 2);
+    Serial.print(", rtc=");
+    Serial.print(rtcStatus);
+    Serial.print('/');
+    Serial.print(rtcTimeValid ? formatDateTimeUtc(currentRtcTime) : String(F("unknown")));
+    Serial.print('/');
+    Serial.print(rtcTimeValid ? formatDateTimeAustralianEastern(currentRtcTime) : String(F("unknown")));
+    Serial.print(", gps=");
+    Serial.print(gpsStatus);
+    Serial.print(", gps_baud=");
+    Serial.print(gpsActiveBaudRate);
+    Serial.print(", gps_fix=");
+    Serial.print(gpsLocationValid ? "yes" : "no");
+    Serial.print(", gps_lat_lon=");
+    if (gpsLocationValid) {
+      Serial.print(gpsLatitude, 6);
+      Serial.print('/');
+      Serial.print(gpsLongitude, 6);
+    } else {
+      Serial.print("unknown");
+    }
+    Serial.print(", gps_sat=");
+    Serial.print(gpsSatellites);
+    Serial.print(", gps_bytes=");
+    Serial.print(gpsBytesThisBoot);
+    Serial.print(", gps_sentences=");
+    Serial.print(gpsSentencesThisBoot);
+    Serial.print(", gps_bad=");
+    Serial.print(gpsFailedChecksumsThisBoot);
+    Serial.print(", gps_last_byte_ms_ago=");
+    Serial.print(lastGpsByteMs > 0 ? now - lastGpsByteMs : 0);
+    Serial.print(", gps_raw=");
+    Serial.print(gpsRawPreview);
     Serial.print(", sd=");
     Serial.print(sdCardStatus);
     Serial.print(", sd_spi_hz=");
